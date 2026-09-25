@@ -28,6 +28,8 @@ from .schemas import (
     ReservationConfirm,
     ReservationCreate,
     ReservationList,
+    ReservationRenewalCreate,
+    ReservationRenewalView,
     ReservationView,
     SelectionPlanRequest,
     SelectionPlanView,
@@ -90,7 +92,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -105,7 +107,14 @@ app = FastAPI(
         "additionally be reserved up-front: reservations lock capacity "
         "atomically (with TTL-based expiry), are idempotent per "
         "reservation_id, and are confirmed into analysis requests or released.  "
-        "A read-only release forecast simulates future TTL expiries up to a "
+        "A granted, not-yet-expired reservation can also be renewed: a "
+        "dataset-unique renewal_id and a positive extend_seconds move its "
+        "expiry instant forward (never more than 90 days past creation) in "
+        "one write transaction that stores an immutable renewal record, "
+        "leaving the reserved amount and original ttl_seconds unchanged and "
+        "occupying no extra budget; same-payload replays return the first "
+        "renewal's before/after expiry instants.  A read-only release "
+        "forecast simulates future TTL expiries up to a "
         "caller-supplied UTC deadline without changing any reservation or "
         "database state.  Epsilon cap can also be transferred between two "
         "registered datasets in one atomic, idempotent transaction: the source "
@@ -199,6 +208,21 @@ async def _reservation_state_conflict(
         content={
             "error": exc.args[0],
             "detail": exc.args[1],
+        },
+    )
+
+
+@app.exception_handler(db.RenewalConflict)
+async def _renewal_conflict(_: Request, exc: db.RenewalConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": "renewal_id_conflict",
+            "renewal_id": exc.args[0],
+            "detail": (
+                "renewal_id was already used for a different renewal payload "
+                "(reservation or extend_seconds differs)"
+            ),
         },
     )
 
@@ -526,6 +550,24 @@ async def confirm_reservation(
 )
 async def release_reservation(dataset_id: DATASET_ID, reservation_id: RESERVATION_ID):
     view, http_status = await ledger.release_reservation(dataset_id, reservation_id)
+    return JSONResponse(status_code=http_status, content=view)
+
+
+@app.post(
+    "/datasets/{dataset_id}/reservations/{reservation_id}/renewals",
+    response_model=ReservationRenewalView,
+    status_code=status.HTTP_201_CREATED,
+    tags=["reservations"],
+    summary="Extend a granted reservation's expiry (idempotent per renewal_id)",
+)
+async def create_reservation_renewal(
+    dataset_id: DATASET_ID,
+    reservation_id: RESERVATION_ID,
+    payload: ReservationRenewalCreate,
+):
+    view, http_status = await ledger.renew_reservation(
+        dataset_id, reservation_id, payload
+    )
     return JSONResponse(status_code=http_status, content=view)
 
 

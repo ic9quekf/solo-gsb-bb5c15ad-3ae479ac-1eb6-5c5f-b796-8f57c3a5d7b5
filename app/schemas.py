@@ -196,6 +196,41 @@ class ReservationConfirm(BaseModel):
     )
 
 
+class ReservationRenewalCreate(BaseModel):
+    """Extend a granted, non-expired reservation's expiry instant.
+
+    The reserved ``epsilon`` / ``delta`` and the original ``ttl_seconds`` stay
+    unchanged and no extra budget is occupied; only ``expires_at`` moves
+    forward by ``extend_seconds``.
+    """
+
+    renewal_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["ren-20260925-0001"],
+        description="Client-generated idempotency key; unique per dataset.",
+    )
+    extend_seconds: int = Field(
+        ...,
+        ge=1,
+        le=MAX_TTL_SECONDS,
+        examples=[600],
+        description="Positive number of seconds appended to the current "
+        "expiry instant.  The resulting expiry may never be more than 90 "
+        "days after the reservation's created_at.",
+    )
+
+    @field_validator("renewal_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
 class BudgetView(BaseModel):
     epsilon_cap: float
     delta_cap: float
@@ -423,6 +458,25 @@ class ReservationList(BaseModel):
     dataset_id: str
     count: int
     reservations: list[ReservationView]
+
+
+class ReservationRenewalView(BaseModel):
+    """Immutable record of one reservation renewal.
+
+    ``expires_at_before`` / ``expires_at_after`` are the reservation's expiry
+    instants just before and just after the extension.  Replaying the same
+    ``(dataset_id, renewal_id)`` with the same payload returns this stored
+    record with ``idempotent_replay = true`` without extending again.
+    """
+
+    renewal_id: str
+    dataset_id: str
+    reservation_id: str
+    extend_seconds: int
+    expires_at_before: datetime
+    expires_at_after: datetime
+    idempotent_replay: bool = False
+    created_at: datetime
 
 
 class ForecastSnapshot(BaseModel):

@@ -200,12 +200,40 @@ CREATE INDEX IF NOT EXISTS idx_request_batch_items_batch
     ON request_batch_items (batch_pk, position);
 """
 
+# Version 6: reservation renewals.  A row is the immutable audit record of
+# one POST .../reservations/{reservation_id}/renewals call (idempotency key
+# ``(dataset_id, renewal_id)``): the granted, non-expired reservation's
+# ``expires_at`` is moved forward by ``extend_seconds`` inside the same write
+# transaction, while epsilon/delta and the original ``ttl_seconds`` stay
+# untouched and no extra budget is occupied.  Replays return the stored
+# before/after expiry instants; the reservation row itself only ever carries
+# the latest ``expires_at``.
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS reservation_renewals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id         TEXT NOT NULL,
+    reservation_id     TEXT NOT NULL,
+    renewal_id         TEXT NOT NULL,
+    extend_seconds     INTEGER NOT NULL,
+    expires_at_before  TEXT NOT NULL,
+    expires_at_after   TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    UNIQUE (dataset_id, renewal_id),
+    FOREIGN KEY (dataset_id, reservation_id)
+        REFERENCES reservations (dataset_id, reservation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_renewals_dataset
+    ON reservation_renewals (dataset_id, id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
     4: SCHEMA_V4,
     5: SCHEMA_V5,
+    6: SCHEMA_V6,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -238,6 +266,10 @@ class ReservationStateConflict(Exception):
 
     ``args[0]`` carries an API error code, ``args[1]`` the human detail.
     """
+
+
+class RenewalConflict(Exception):
+    """Same renewal_id reused with a different payload (HTTP 409)."""
 
 
 class TransferConflict(Exception):
@@ -656,6 +688,64 @@ async def backdate_reservation_expiry(
         "WHERE dataset_id = ? AND reservation_id = ?",
         (expires_at, dataset_id, reservation_id),
     )
+
+
+# ---------------------------------------------------------------- renewals --
+
+
+_RENEWAL_SELECT = (
+    "SELECT dataset_id, reservation_id, renewal_id, extend_seconds, "
+    "expires_at_before, expires_at_after, created_at "
+    "FROM reservation_renewals"
+)
+
+
+async def extend_reservation_expiry(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    expires_at: str,
+) -> None:
+    """Move a granted reservation's expiry instant forward (renewal)."""
+    await db.execute(
+        "UPDATE reservations SET expires_at = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (expires_at, dataset_id, reservation_id),
+    )
+
+
+async def insert_reservation_renewal(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    renewal_id: str,
+    extend_seconds: int,
+    expires_at_before: str,
+    expires_at_after: str,
+    created_at: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO reservation_renewals "
+        "(dataset_id, reservation_id, renewal_id, extend_seconds, "
+        "expires_at_before, expires_at_after, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id, reservation_id, renewal_id, extend_seconds,
+            expires_at_before, expires_at_after, created_at,
+        ),
+    )
+
+
+async def get_reservation_renewal(
+    db: aiosqlite.Connection, dataset_id: str, renewal_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(
+        f"{_RENEWAL_SELECT} WHERE dataset_id = ? AND renewal_id = ?",
+        (dataset_id, renewal_id),
+    ) as cur:
+        return await cur.fetchone()
 
 
 # ------------------------------------------------------------ cap transfers --
