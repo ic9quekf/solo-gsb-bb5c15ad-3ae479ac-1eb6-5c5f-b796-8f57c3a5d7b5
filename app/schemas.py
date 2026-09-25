@@ -196,6 +196,41 @@ class ReservationConfirm(BaseModel):
     )
 
 
+class ReservationRenewal(BaseModel):
+    """Extend a still-valid granted reservation's expiry instant.
+
+    The renewal moves ``expires_at`` ``extend_seconds`` later without changing
+    the reserved epsilon/delta or the original ``ttl_seconds`` and without
+    locking any additional budget.
+    """
+
+    renewal_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["ren-20260925-0001"],
+        description="Client-generated idempotency key; unique per dataset.",
+    )
+    extend_seconds: int = Field(
+        ...,
+        ge=1,
+        examples=[3600],
+        description="Positive integer number of seconds to move the "
+        "reservation's expiry instant into the future.  The renewed expiry may "
+        "never lie more than 90 days after the reservation's original "
+        "created_at.",
+    )
+
+    @field_validator("renewal_id")
+    @classmethod
+    def _valid_renewal_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
 class BudgetView(BaseModel):
     epsilon_cap: float
     delta_cap: float
@@ -423,6 +458,32 @@ class ReservationList(BaseModel):
     dataset_id: str
     count: int
     reservations: list[ReservationView]
+
+
+class ReservationRenewalView(BaseModel):
+    """Immutable record of one reservation renewal.
+
+    A renewal only moves ``expires_at`` later: the reservation's epsilon,
+    delta and original ``ttl_seconds`` are unchanged and no additional budget
+    is locked.  ``expires_before`` / ``expires_after`` are the reservation's
+    expiry instants immediately before and after this renewal.  Replaying the
+    same ``(dataset_id, renewal_id)`` returns this stored record with
+    ``idempotent_replay = true`` -- including the original before/after
+    instants -- even after later renewals or the reservation's expiry.
+    """
+
+    dataset_id: str
+    reservation_id: str
+    renewal_id: str
+    extend_seconds: int
+    expires_before: datetime
+    expires_after: datetime
+    # The reservation's original TTL, unchanged by renewals.
+    ttl_seconds: int
+    # The hard lifetime ceiling: expires_after is at most this instant.
+    max_expires_at: datetime
+    idempotent_replay: bool = False
+    created_at: datetime
 
 
 class ForecastSnapshot(BaseModel):

@@ -200,12 +200,42 @@ CREATE INDEX IF NOT EXISTS idx_request_batch_items_batch
     ON request_batch_items (batch_pk, position);
 """
 
+# Version 6: reservation renewals.  A row is the immutable audit record of one
+# POST .../reservations/{reservation_id}/renewals call: the per-dataset
+# idempotency key ``(dataset_id, renewal_id)``, the positive integer
+# ``extend_seconds`` and the reservation's expiry instant immediately before and
+# after the renewal.  A renewal only moves ``reservations.expires_at`` later:
+# epsilon/delta/ttl_seconds are untouched and the reservation keeps occupying
+# the budget it already locked (it is never charged a second time), so no
+# admission re-check is needed.  The hard lifetime ceiling (new expiry no more
+# than 90 days after the reservation's original created_at) is enforced by the
+# ledger inside the same write transaction.
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS reservation_renewals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id      TEXT NOT NULL,
+    reservation_id  TEXT NOT NULL,
+    renewal_id      TEXT NOT NULL,
+    extend_seconds  INTEGER NOT NULL,
+    expires_before  TEXT NOT NULL,
+    expires_after   TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (dataset_id, renewal_id),
+    FOREIGN KEY (dataset_id, reservation_id)
+        REFERENCES reservations (dataset_id, reservation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_renewals_dataset
+    ON reservation_renewals (dataset_id, id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
     4: SCHEMA_V4,
     5: SCHEMA_V5,
+    6: SCHEMA_V6,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -276,6 +306,10 @@ class BatchItemDuplicate(Exception):
 
     ``args[0]`` carries the duplicated request_id.
     """
+
+
+class RenewalConflict(Exception):
+    """Same renewal_id reused with a different renewal payload (HTTP 409)."""
 
 
 # -------------------------------------------------------------- connection --
@@ -655,6 +689,69 @@ async def backdate_reservation_expiry(
         "UPDATE reservations SET expires_at = ? "
         "WHERE dataset_id = ? AND reservation_id = ?",
         (expires_at, dataset_id, reservation_id),
+    )
+
+
+async def extend_reservation_expiry(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    expires_at: str,
+) -> None:
+    """Move an outstanding granted reservation's expiry instant later.
+
+    Only the ``expires_at`` column changes: epsilon/delta/ttl_seconds and the
+    admission snapshots stay untouched, so the reservation keeps the budget it
+    already locked and is never charged a second time.  The status guard makes
+    the renewal a no-op once the reservation has left the ``granted`` state;
+    callers check the lifecycle state beforehand inside the same transaction.
+    """
+    await db.execute(
+        "UPDATE reservations SET expires_at = ? "
+        "WHERE dataset_id = ? AND reservation_id = ? AND status = 'granted'",
+        (expires_at, dataset_id, reservation_id),
+    )
+
+
+_RENEWAL_SELECT = (
+    "SELECT id, dataset_id, reservation_id, renewal_id, extend_seconds, "
+    "expires_before, expires_after, created_at "
+    "FROM reservation_renewals"
+)
+
+
+async def get_reservation_renewal(
+    db: aiosqlite.Connection, dataset_id: str, renewal_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(
+        f"{_RENEWAL_SELECT} WHERE dataset_id = ? AND renewal_id = ?",
+        (dataset_id, renewal_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def insert_reservation_renewal(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    reservation_id: str,
+    renewal_id: str,
+    extend_seconds: int,
+    expires_before: str,
+    expires_after: str,
+    created_at: str,
+) -> None:
+    """Insert one immutable renewal record inside the caller's transaction."""
+    await db.execute(
+        "INSERT INTO reservation_renewals "
+        "(dataset_id, reservation_id, renewal_id, extend_seconds, "
+        "expires_before, expires_after, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id, reservation_id, renewal_id, extend_seconds,
+            expires_before, expires_after, created_at,
+        ),
     )
 
 

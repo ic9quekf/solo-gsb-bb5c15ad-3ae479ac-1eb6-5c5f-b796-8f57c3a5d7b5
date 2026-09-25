@@ -14,9 +14,15 @@ Rényi DP（RDP）orders 上累加各次申请的组合消耗，在并发申请�
 同一 `reservation_id` + 同负载重放幂等、负载冲突返回 `409`。预留可在 TTL
 内**确认（confirm）**为一次正式分析申请（沿用同一套 RDP 核算，预算不重复
 扣减），也可随时幂等**释放（release）**；超过 TTL 未确认的预留自动过期、
-在查询与新建预留/申请时不再占用额度。还提供**只读**的预算释放预测接口：
-给定一个未来 UTC 截止时间，按 `expires_at` 分组模拟预留到期并逐刻重算
-剩余 epsilon 与活动预留数，全程不改写任何预留状态或数据库。
+在查询与新建预留/申请时不再占用额度。仍未到期的 granted 预留还可以
+**续期（renewal）**：提交数据集内幂等键 `renewal_id` 与正整数
+`extend_seconds`，在同一个 SQLite 写事务内校验状态后把到期时刻向后顺延
+——预留金额与原始 `ttl_seconds` 不变、**不重复占额**，新到期时刻距预留
+**创建时刻不得超过 90 天**；每次续期另写一条不可变续期记录，同
+`renewal_id` 同负载重试回放首次续期的前后到期时刻、异负载 `409`。还提供
+**只读**的预算释放预测接口：给定一个未来 UTC 截止时间，按 `expires_at`
+分组模拟预留到期并逐刻重算剩余 epsilon 与活动预留数，全程不改写任何预留
+状态或数据库。
 
 此外支持数据集内的**原子分析批次（request batch）**：
 `POST /datasets/{dataset_id}/request-batches` 携带一个 `batch_id` 与
@@ -178,6 +184,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/datasets/{dataset_id}/reservations/{reservation_id}` | 查询单个预留 |
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/confirm` | 确认预留 → 分析申请（幂等） |
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/release` | 释放预留（幂等） |
+| `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/renewals` | 续期未到期 granted 预留：顺延到期时刻（按 `renewal_id` 幂等，不重复占额，90 天上限） |
 | `GET` | `/datasets/{dataset_id}/budget/release-forecast?deadline=...` | **只读**模拟截止时间前的预留到期释放 |
 | `POST` | `/budget-transfers` | 在两个数据集间原子转拨 epsilon 上限（幂等） |
 | `GET` | `/health` | 健康检查 |
@@ -604,7 +611,102 @@ curl -G http://localhost:8000/datasets/sales-2026/budget/release-forecast \
 * 无时区信息的裸时间 → `422 invalid_forecast_deadline`；
 * `deadline` 不晚于当前时间 → `422 invalid_forecast_deadline`。
 
-### 4.13 epsilon 上限转拨（budget transfer）
+### 4.13 预留续期（renewal，顺延到期时刻）
+
+仍处于 **granted 且未到期** 的预留可以续期：把它的到期时刻
+`expires_at` 向后顺延一段正整数秒数。续期**只改到期时刻**——预留的
+`epsilon` / `delta` 与原始 `ttl_seconds` 均保持不变，预留继续占用它**创建
+时已锁定**的那部分预算，因此**不重新做准入判定、不重复占额**。
+
+```bash
+curl -X POST \
+  http://localhost:8000/datasets/sales-2026/reservations/res-20260923-0001/renewals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "renewal_id": "ren-20260924-0001",
+    "extend_seconds": 3600
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `renewal_id` | string | 必填，客户端生成的幂等键（字母/数字/`.`/`_`/`-`，1–200），**同一数据集内唯一** |
+| `extend_seconds` | int | 必填，**正整数**（`≥ 1`），到期时刻向后顺延的秒数 |
+
+服务在**同一个 `BEGIN IMMEDIATE` 写事务**内完成「惰性过期清理 →
+`renewal_id` 查重 → 预留状态校验 → 90 天上限校验 → 顺延到期时刻 → 写入不可变
+续期记录」。顺延规则与上限：
+
+* 新到期时刻 `expires_after = expires_before + extend_seconds`，即从预留
+  **当前**到期时刻（可能已经被前几次续期顺延过）继续向后顺延；
+* 但无论续期几次，`expires_after` 距预留的**原始创建时刻** `created_at`
+  **不得超过 90 天**（即 `≤ created_at + 7776000 秒`，与创建预留时
+  `ttl_seconds` 的上限一致）；超过上限返回
+  `409 reservation_renewal_exceeds_max_ttl`，**到期时刻与任何预算状态都不
+  改变**（失败的尝试不写续期记录，其 `renewal_id` 可再次使用）。
+
+首次续期成功返回 `201`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "reservation_id": "res-20260923-0001",
+  "renewal_id": "ren-20260924-0001",
+  "extend_seconds": 3600,
+  "expires_before": "2026-09-23T01:20:16.563790+00:00",
+  "expires_after": "2026-09-23T02:20:16.563790+00:00",
+  "ttl_seconds": 600,
+  "max_expires_at": "2026-12-22T01:10:16.563790+00:00",
+  "idempotent_replay": false,
+  "created_at": "2026-09-24T09:30:00.000000+00:00"
+}
+```
+
+字段说明：`expires_before` / `expires_after` 为本次续期前后的预留到期时刻
+（`expires_after − expires_before` 恰为 `extend_seconds`）；`ttl_seconds`
+是预留的**原始** TTL，续期不改变它；`max_expires_at` 为
+`预留 created_at + 90 天` 的硬上限；`created_at` 为续期记录自身的创建时刻。
+
+续期生效后，预留的金额与状态不变：
+
+* 预留查询 `GET …/reservations/{reservation_id}` 与列表中的
+  `expires_at` 即**新到期时刻**，`ttl_seconds` 仍为创建时的原始值；
+* 预算明细 / 数据集信息、新建申请与预留的准入、预留 `confirm`：只要预留
+  仍未到期就继续按同一份已锁定预算计入，**不会**因为续期而二次占额；
+* 只读的 `…/budget/release-forecast` 直接按**新到期时刻**分组模拟释放：
+  截止时间晚于旧到期时刻但早于新到期时刻时，该预留仍计入 `at_deadline`；
+  续期后可在新到期时刻被模拟释放；
+* 续期后再 `confirm`：仍是把预留已锁定的 `(epsilon, delta)` 转为 granted
+  申请，`epsilon_after` 不变，预算只扣一次。
+
+状态与冲突语义：
+
+* 仅 **granted 且当前未到期**的预留可续期；
+* 预留**已到期** → `409 reservation_expired`（事务内先做惰性清扫，因此刚
+  到点的预留即使尚未被其他请求清扫也不能续期）；
+* 预留为 `confirmed` / `released` / `rejected` →
+  `409 reservation_confirmed` / `reservation_released` /
+  `reservation_rejected`；
+* 预留不存在 → `404 reservation_not_found`；数据集不存在 →
+  `404 dataset_not_found`；
+* `extend_seconds ≤ 0` 或非整数、`renewal_id` 为空 / 超长 / 含非法字符 →
+  `422`。
+
+幂等语义：
+
+* 相同 `(dataset_id, renewal_id)` + **相同负载**（同一目标预留、同一
+  `extend_seconds`）重试：返回 `200` 与**首次续期记录**——
+  `expires_before` / `expires_after` 永远是**那次**续期的前后到期时刻，
+  `idempotent_replay=true`，到期时刻**只顺延一次**；即使其间又发生了其他
+  续期、或预留随后已到期 / 进入终态，重放结果也不变（续期记录不可变）；
+* 相同 `renewal_id` 但目标预留不同、或 `extend_seconds` 不同：返回
+  `409 renewal_id_conflict`，不产生任何变更；
+* `renewal_id` 的作用域为**单个数据集**：不同数据集可以使用相同的
+  `renewal_id`。
+
+### 4.14 epsilon 上限转拨（budget transfer）
 
 在两个已登记数据集之间转拨 epsilon 上限，**delta_cap 与所有已入账申请、
 预留都不改变**：
@@ -690,7 +792,7 @@ epsilon_committed`（成功时为转拨后的新 cap，拒绝时为原 cap）。
 完成；并发转拨之间、转拨与申请 / 预留之间无论怎样交错，预算都不会透支
 （来源新 cap 永远覆盖其占用），且两端 epsilon_cap 之和守恒。
 
-### 4.14 冲正已授权申请（reversal）
+### 4.15 冲正已授权申请（reversal）
 
 当一次已授权（直接 granted，或由预留 confirmed）的分析申请需要撤销时，可
 以对其发起**冲正**。冲正**不删除、不改写**原申请：`requests` 中的原始裁定
@@ -783,7 +885,7 @@ curl -X POST \
   `reversal_reason`、`reversed_at` 字段；未冲正的申请这些字段为
   `false` / `null`，原裁定字段保持为受理当时的历史值。
 
-### 4.15 候选组合试算（selection plan，只读）
+### 4.16 候选组合试算（selection plan，只读）
 
 在**不创建任何申请 / 预留 / 裁定记录**的前提下，对 1～12 个候选分析项穷举
 可行子集，返回当前账本下总 `value` 最大的组合。占用基线与正式准入完全一致：
@@ -870,7 +972,7 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
 * 候选数为 0 或超过 12、`candidate_id` 重复或为空、`epsilon` / `delta` 越界、
   `value` 非正整数（含小数）等 → `422`。
 
-### 4.16 隐私成本归因（cost attribution，只读）
+### 4.17 隐私成本归因（cost attribution，只读）
 
 在**不创建任何记录、不改变预留状态**的前提下，把一组**已授权且未冲正**申请
 「整组选入」造成的 epsilon 增量，按标准 **Shapley 值**分摊给组内每个申请。
@@ -1002,6 +1104,12 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
    集合」：确认前后的组合曲线完全相同，因此不发生二次扣减；释放与过期
    则从组合中移除该条预留，额度立即/自动归还。
 
+6. 续期（renewal）**不改变任何组合集合、也不重新占额**：它只把预留的
+   `expires_at` 向后顺延（金额与原始 `ttl_seconds` 不变），因此续期前后
+   「已授权申请 ∪ 未到期预留」的组合曲线完全相同；顺延只影响该预留被
+   视为未到期的时间窗——预留查询、确认、准入与只读释放预测都自然按新
+   `expires_at` 工作。硬约束是新到期时刻不得晚于预留 `created_at + 90 天`。
+
 6. 冲正（reversal）把一条已授权申请从「已授权申请集合」移除并另写不可变
    冲正记录：所有读 / 写路径的 granted 集合都统一排除带冲正记录的申请，
    原申请的历史 `epsilon_before` / `epsilon_after` 不被改写。批次裁定
@@ -1038,7 +1146,7 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
 
 ## 6. 并发与原子性
 
-* 每个写操作（登记、提交申请、提交原子分析批次、创建/确认/释放预留、
+* 每个写操作（登记、提交申请、提交原子分析批次、创建/确认/释放/续期预留、
   epsilon 上限转拨、申请冲正）在进程内 `asyncio.Lock` 保护下打开一个 SQLite
   **`BEGIN IMMEDIATE`** 事务：「惰性过期清理 → 查重/查状态 → 重算（未冲正
   已授权申请 + 有效预留）组合消耗 → 判定 → 插入/更新记录」在同一个事务
@@ -1061,6 +1169,12 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
   交错也不会使来源预算透支；
 * 预留的确认同样在该临界区内完成「插入 granted 申请 + 预留置
   confirmed」，两步原子，预算不可能被扣两次；
+* 预留的续期同样在该临界区内一次完成「`renewal_id` 查重与负载比对 →
+  惰性清扫与预留状态校验（必须 granted 且未到期）→ 90 天硬上限校验 →
+  UPDATE `expires_at` → 写入不可变 reservation_renewals 记录」：续期只
+  顺延到期时刻、不动金额，因此不重新做 RDP 准入、不重复占额；相同
+  `renewal_id` 的并发重试被串行化为一次顺延（其余回放首次记录），超限 /
+  终态 / 已到期时整笔回滚，到期时刻保持原样；
 * SQLite 启用 **WAL** 与 `busy_timeout`：读不阻塞写，写冲突排队等待
   而非立即报错；`(dataset_id, request_id)`、`(dataset_id, reservation_id)`
   与 `(dataset_id, batch_id)` 上各有 `UNIQUE` 约束作为最终防线；
@@ -1090,6 +1204,7 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 | 3 | 新增 `budget_transfers` 表（全局唯一 `transfer_id`、来源/目标、金额、状态、两端 cap 转拨前后快照与占用、时间戳） |
 | 4 | 新增 `request_reversals` 表（全局唯一 `reversal_id`、目标申请、原因、冲正前后组合 epsilon 快照与时间戳；`(dataset_id, request_id)` 唯一）。已有 granted 申请在显式冲正前核算口径不变 |
 | 5 | 新增 `request_batches` / `request_batch_items` 表（`(dataset_id, batch_id)` 唯一、按提交顺序保存各项及累计组合快照；granted 批次的各项同时写入 `requests`，rejected 批次不写申请行）。已有申请 / 预留 / 冲正记录原样保留，核算口径不变 |
+| 6 | 新增 `reservation_renewals` 表（`(dataset_id, renewal_id)` 唯一、外键指向 `(dataset_id, reservation_id)`；保存正整数 `extend_seconds` 与续期前后到期时刻、记录创建时间，行不可变）。续期只 UPDATE 预留的 `expires_at`，金额与 `ttl_seconds` 不变；已有数据集 / 申请 / 预留等记录原样保留，核算口径不变 |
 
 旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再顺序升级
 到最新版本，已有数据集、申请与预留记录原样保留。
@@ -1113,6 +1228,18 @@ RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409�
 409、TTL 过期在查询与新建时释放额度、60 路并发预留不超预算、15 路并发
 确认仅一条申请、预留/确认/释放/直接申请混合并发下始终不超 cap，以及
 从 v1 schema 启动时的自动迁移。
+
+预留续期测试另覆盖：到期时刻恰顺延 `extend_seconds` 而金额与原始
+`ttl_seconds` 不变、预算占用（reserved/remaining）续期前后一致不重复占额、
+同 `renewal_id` 同负载重放（即使已有后续续期或预留已过期）始终返回首次
+续期的前后到期时刻且到期时刻只顺延一次、异 `extend_seconds` 或异目标预留
+409、`renewal_id` 按数据集隔离、预留 / 数据集缺失 404、已到期与
+confirmed/released/rejected 终态新续期 409、90 天硬上限边界（恰好到
+created_at+90 天通过、超过 409 且到期时刻不变、失败 id 可复用）、多次续期
+累计仍受原始创建时刻 +90 天约束、负载非法（非正整数 / 非法 id / 缺字段）
+422、续期后旧 TTL 已过仍保持占额并阻止超额申请、只读释放预测按新到期时刻
+模拟、续期后确认仍只扣一次、20 路相同 `renewal_id` 并发仅顺延一次且仅一条
+不可变记录，以及从 v5 schema 启动时自动迁移出 `reservation_renewals` 表。
 
 只读释放预测测试覆盖：同刻到期分组移除与逐刻 RDP 重算（并用 `rdp.py`
 独立核算交叉校验）、恰好在截止时刻到期的边界、早于任何到期的预测区间、

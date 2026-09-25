@@ -17,9 +17,11 @@ from .schemas import (
     CostAttributionRequest,
     DatasetRegister,
     MAX_EPSILON_CAP,
+    MAX_TTL_SECONDS,
     ReversalCreate,
     ReservationConfirm,
     ReservationCreate,
+    ReservationRenewal,
     SelectionPlanCandidate,
     utcnow,
 )
@@ -1001,6 +1003,145 @@ async def release_reservation(
 
             row = await db.get_reservation(conn, dataset_id, reservation_id)
             return _reservation_view(row, dataset, replay=False), 200
+
+
+def _renewal_view_from_row(
+    row: aiosqlite.Row, reservation: aiosqlite.Row, *, replay: bool
+) -> dict[str, Any]:
+    return {
+        "dataset_id": row["dataset_id"],
+        "reservation_id": row["reservation_id"],
+        "renewal_id": row["renewal_id"],
+        "extend_seconds": row["extend_seconds"],
+        "expires_before": row["expires_before"],
+        "expires_after": row["expires_after"],
+        # The original TTL is never rewritten by a renewal.
+        "ttl_seconds": reservation["ttl_seconds"],
+        # The hard lifetime ceiling: expires_after is at most this instant.
+        "max_expires_at": (
+            datetime.fromisoformat(reservation["created_at"])
+            + timedelta(seconds=MAX_TTL_SECONDS)
+        ).isoformat(),
+        "idempotent_replay": replay,
+        "created_at": row["created_at"],
+    }
+
+
+async def renew_reservation(
+    dataset_id: str, reservation_id: str, payload: ReservationRenewal
+) -> tuple[dict[str, Any], int]:
+    """Extend an outstanding granted reservation's TTL expiry.
+
+    The reservation's ``expires_at`` is moved exactly ``extend_seconds`` later
+    in the same ``BEGIN IMMEDIATE`` transaction that validates state and writes
+    the immutable renewal record.  Epsilon/delta and the original
+    ``ttl_seconds`` are untouched and the reservation keeps the budget it
+    already locked, so no admission re-check runs and no budget is occupied
+    twice.
+
+    The renewed expiry must not lie more than :data:`MAX_TTL_SECONDS` (90 days)
+    after the reservation's original ``created_at``; a longer extension is a
+    409 and leaves the expiry untouched.
+
+    Replaying the same ``(dataset_id, renewal_id)`` with the same target
+    reservation and the same ``extend_seconds`` returns the stored record --
+    including the original before/after expiry instants -- even after later
+    renewals or the reservation's eventual expiry; a different target or
+    extension is a 409.  An unknown reservation is a 404; renewing an expired
+    or terminal (confirmed/released/rejected) reservation is a 409.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+
+    async with _write_lock():
+        async with db.connect() as conn:
+            await db.begin_immediate(conn)
+            try:
+                # Look the idempotency key up first, so retries replay the
+                # original record even when the reservation has since expired
+                # or reached a terminal state.
+                existing = await db.get_reservation_renewal(
+                    conn, dataset_id, payload.renewal_id
+                )
+                if existing is not None:
+                    same = (
+                        existing["reservation_id"] == reservation_id
+                        and existing["extend_seconds"] == payload.extend_seconds
+                    )
+                    if not same:
+                        raise db.RenewalConflict(payload.renewal_id)
+                    reservation = await db.get_reservation(
+                        conn, dataset_id, existing["reservation_id"]
+                    )
+                    assert reservation is not None
+                    view = _renewal_view_from_row(
+                        existing, reservation, replay=True
+                    )
+                    await conn.commit()
+                    return view, 200
+
+                # Raises DatasetNotFound (404) if the dataset is missing.
+                await db.require_dataset(conn, dataset_id)
+                row = await db.get_reservation(conn, dataset_id, reservation_id)
+                if row is None:
+                    raise db.ReservationNotFound(reservation_id)
+                # Sweep the row first so an expired-but-not-yet-swept
+                # reservation is rejected as expired, not renewed.
+                row = await _refresh_reservation_row(conn, row, now_iso)
+                if row["status"] != "granted":
+                    raise db.ReservationStateConflict(
+                        f"reservation_{row['status']}",
+                        f"reservation is {row['status']} and cannot be renewed",
+                    )
+
+                expires_before_iso = row["expires_at"]
+                # Every granted reservation has an expiry instant; a NULL one
+                # would mean it never occupied any TTL budget.
+                assert expires_before_iso is not None
+                expires_before = datetime.fromisoformat(expires_before_iso)
+                expires_after = expires_before + timedelta(
+                    seconds=payload.extend_seconds
+                )
+                max_expires_at = datetime.fromisoformat(
+                    row["created_at"]
+                ) + timedelta(seconds=MAX_TTL_SECONDS)
+                if expires_after > max_expires_at:
+                    raise db.ReservationStateConflict(
+                        "reservation_renewal_exceeds_max_ttl",
+                        f"renewed expiry {expires_after.isoformat()} would be "
+                        "more than 90 days after the reservation's creation "
+                        f"{row['created_at']}",
+                    )
+
+                expires_after_iso = expires_after.isoformat()
+                await db.extend_reservation_expiry(
+                    conn,
+                    dataset_id=dataset_id,
+                    reservation_id=reservation_id,
+                    expires_at=expires_after_iso,
+                )
+                await db.insert_reservation_renewal(
+                    conn,
+                    dataset_id=dataset_id,
+                    reservation_id=reservation_id,
+                    renewal_id=payload.renewal_id,
+                    extend_seconds=payload.extend_seconds,
+                    expires_before=expires_before_iso,
+                    expires_after=expires_after_iso,
+                    created_at=now_iso,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+            record = await db.get_reservation_renewal(
+                conn, dataset_id, payload.renewal_id
+            )
+            reservation = await db.get_reservation(
+                conn, dataset_id, reservation_id
+            )
+            return _renewal_view_from_row(record, reservation, replay=False), 201
 
 
 async def get_reservation(dataset_id: str, reservation_id: str) -> dict[str, Any]:
